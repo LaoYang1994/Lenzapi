@@ -329,7 +329,11 @@ class COCOeval:
         M           = len(p.maxDets)
         precision   = -np.ones((T,R,K,A,M)) # -1 for the precision of absent categories
         recall      = -np.ones((T,K,A,M))
+        f1          = -np.ones((T,K,A,M))
+        acc         = -np.ones((T,K,A,M))
         scores      = -np.ones((T,R,K,A,M))
+        cat_num     = np.zeros(K)
+        gt_num     = np.zeros(K)
 
         # create dictionary for future indexing
         _pe = self._paramsEval
@@ -356,16 +360,22 @@ class COCOeval:
                     if len(E) == 0:
                         continue
                     dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
+                    if a == 0 and m == len(m_list) - 1:
+                        cat_num[k] = dtScores.size
 
                     # different sorting method generates slightly different results.
                     # mergesort is used to be consistent as Matlab implementation.
-                    inds = np.argsort(-dtScores, kind='mergesort')
+                    inds = np.argsort(-dtScores, kind='mergesort')      # to compute mAP
                     dtScoresSorted = dtScores[inds]
 
                     dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
                     dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
                     gtIg = np.concatenate([e['gtIgnore'] for e in E])
                     npig = np.count_nonzero(gtIg==0 )
+
+                    if a == 0 and m == len(m_list) - 1:
+                        cat_num[k] = dtScores.size
+                        gt_num[k] = npig
                     if npig == 0:
                         continue
                     tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
@@ -383,9 +393,11 @@ class COCOeval:
                         ss = np.zeros((R,))
 
                         if nd:
-                            recall[t,k,a,m] = rc[-1]
+                            recall[t, k, a, m] = rc[-1]
+                            acc[t, k, a, m]    = pr[-1]
+                            f1[t, k, a, m] = 2.0 * rc[-1] * pr[-1] / (rc[-1] + pr[-1] + np.spacing(1))
                         else:
-                            recall[t,k,a,m] = 0
+                            recall[t,k,a,m] = f1[t, k, a, m] = acc[t, k, a, m] = 0
 
                         # numpy is slow without cython optimization for accessing elements
                         # use python array gets significant speed improvement
@@ -404,13 +416,18 @@ class COCOeval:
                             pass
                         precision[t,:,k,a,m] = np.array(q)
                         scores[t,:,k,a,m] = np.array(ss)
+                        # print(k, a, m, t, q[-1], pr[-1])
         self.eval = {
             'params': p,
             'counts': [T, R, K, A, M],
             'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'precision': precision,
-            'recall':   recall,
+            'recall': recall,
+            'accuracy': acc,
+            'f1': f1,
             'scores': scores,
+            'cat_num': cat_num,
+            'gt_num': gt_num,
         }
         toc = time.time()
         print('DONE (t={:0.2f}s).'.format( toc-tic))
@@ -422,9 +439,12 @@ class COCOeval:
         '''
         def _summarize( ap=1, iouThr=None, areaRng='all', maxDets=500):
             p = self.params
-            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.3f}'
+            mean_f = -1.0
+            mean_a = -1.0
+            mean_r = -1.0
+            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.4f}, {:0.4f}, {:0.4f}, {:0.4f}'
             titleStr = 'Average Precision' if ap == 1 else 'Average Recall'
-            typeStr = '(AP)' if ap==1 else '(AR)'
+            typeStr = '(AP, f1, acc, rec)' if ap==1 else '(AR)'
             iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
                 if iouThr is None else '{:0.2f}'.format(iouThr)
 
@@ -433,11 +453,20 @@ class COCOeval:
             if ap == 1:
                 # dimension of precision: [TxRxKxAxM]
                 s = self.eval['precision']
+                f = self.eval['f1']
+                a = self.eval['accuracy']
+                r = self.eval['recall']
                 # IoU
                 if iouThr is not None:
                     t = np.where(iouThr == p.iouThrs)[0]
                     s = s[t]
+                    f = f[t]
+                    a = a[t]
+                    r = r[t]
                 s = s[:,:,:,aind,mind]
+                f = f[:, :, aind,mind]
+                a = a[:, :, aind,mind]
+                r = r[:, :, aind,mind]
             else:
                 # dimension of recall: [TxKxAxM]
                 s = self.eval['recall']
@@ -449,22 +478,78 @@ class COCOeval:
                 mean_s = -1
             else:
                 mean_s = np.mean(s[s>-1])
-            print(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, mean_s))
+
+            if len(f[f>-1])==0:
+                mean_f = -1
+            else:
+                mean_f = np.mean(f[f>-1])
+
+            if len(a[a>-1])==0:
+                mean_a = -1
+            else:
+                mean_a = np.mean(a[a>-1])
+
+            if len(r[r>-1])==0:
+                mean_r = -1
+            else:
+                mean_r = np.mean(r[r>-1])
+
+            print(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, mean_s, mean_f, mean_a, mean_r))
             return mean_s
+
+        def _summarize_by_cls(iouThr=None, areaRng='all', maxDets=500):
+            p = self.params
+            mean_f = -1.0
+            mean_a = -1.0
+            mean_r = -1.0
+            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} | cat_id={:>3d}] = {:0.4f}, {:0.4f}, {:0.4f}'
+            titleStr = 'Average Precision'
+            typeStr = '(f1, acc, rec)'
+            iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
+                if iouThr is None else '{:0.2f}'.format(iouThr)
+
+            aind = [i for i, aRng in enumerate(p.areaRngLbl) if aRng == areaRng]
+            mind = [i for i, mDet in enumerate(p.maxDets) if mDet == maxDets]
+            if True:
+                # dimension of precision: [TxRxKxAxM]
+                cat_num = self.eval['cat_num']
+                gt_num = self.eval['gt_num']
+                f = self.eval['f1']
+                a = self.eval['accuracy']
+                r = self.eval['recall']
+                # IoU
+                if iouThr is not None:
+                    t = np.where(iouThr == p.iouThrs)[0]
+                    f = f[t]
+                    a = a[t]
+                    r = r[t]
+                f = f[0, :, aind[0],mind[0]]
+                a = a[0, :, aind[0],mind[0]]
+                r = r[0, :, aind[0],mind[0]]
+                for i, cat_id in enumerate(p.catIds):
+                    print(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, cat_id, f[i], a[i], r[i]))
+                total_acc = np.sum(a * cat_num) / np.sum(cat_num)
+                total_rec = np.sum(r * gt_num) / np.sum(gt_num)
+                total_f1 = 2.0 * total_acc * total_rec / (total_acc + total_rec + np.spacing(1))
+                print(iStr.format(titleStr, typeStr, iouStr, areaRng, maxDets, -1, total_f1, total_acc, total_rec))
+
         def _summarizeDets():
-            stats = np.zeros((12,))
+            stats = np.zeros((100,))
             stats[0] = _summarize(1)
-            stats[1] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2])
-            stats[2] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2])
-            stats[3] = _summarize(1, areaRng='small', maxDets=self.params.maxDets[2])
-            stats[4] = _summarize(1, areaRng='medium', maxDets=self.params.maxDets[2])
-            stats[5] = _summarize(1, areaRng='large', maxDets=self.params.maxDets[2])
-            stats[6] = _summarize(0, maxDets=self.params.maxDets[0])
-            stats[7] = _summarize(0, maxDets=self.params.maxDets[1])
-            stats[8] = _summarize(0, maxDets=self.params.maxDets[2])
-            stats[9] = _summarize(0, areaRng='small', maxDets=self.params.maxDets[2])
-            stats[10] = _summarize(0, areaRng='medium', maxDets=self.params.maxDets[2])
-            stats[11] = _summarize(0, areaRng='large', maxDets=self.params.maxDets[2])
+            for i in range(10):
+                stats[i+1] = _summarize(1, iouThr=self.params.iouThrs[i], maxDets=self.params.maxDets[-1]) 
+            # stats[1] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2])
+            # stats[2] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2])
+            stats[3] = _summarize(1, areaRng='small', maxDets=self.params.maxDets[-1])
+            stats[4] = _summarize(1, areaRng='medium', maxDets=self.params.maxDets[-1])
+            stats[5] = _summarize(1, areaRng='large', maxDets=self.params.maxDets[-1])
+            _summarize_by_cls(iouThr=.5, maxDets=self.params.maxDets[-1])
+            # stats[6] = _summarize(0, maxDets=self.params.maxDets[0])
+            # stats[7] = _summarize(0, maxDets=self.params.maxDets[1])
+            # stats[8] = _summarize(0, maxDets=self.params.maxDets[2])
+            # stats[9] = _summarize(0, areaRng='small', maxDets=self.params.maxDets[2])
+            # stats[10] = _summarize(0, areaRng='medium', maxDets=self.params.maxDets[2])
+            # stats[11] = _summarize(0, areaRng='large', maxDets=self.params.maxDets[2])
             return stats
         if not self.eval:
             raise Exception('Please run accumulate() first')
@@ -486,7 +571,8 @@ class Params:
         # np.arange causes trouble.  the data point on arange is slightly larger than the true value
         self.iouThrs = np.linspace(.5, 0.95, np.round((0.95 - .5) / .05) + 1, endpoint=True)
         self.recThrs = np.linspace(.0, 1.00, np.round((1.00 - .0) / .01) + 1, endpoint=True)
-        self.maxDets = [1, 10, 50, 100, 150, 200, 500]
+        self.maxDets = [500]
+        # self.maxDets = [1, 10, 50, 100, 150, 200, 500]
         self.areaRng = [[0 ** 2, 1e5 ** 2], [0 ** 2, 32 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e5 ** 2]]
         self.areaRngLbl = ['all', 'small', 'medium', 'large']
         self.useCats = 1
